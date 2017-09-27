@@ -15,7 +15,7 @@ extern "C"
 	void forward_probability(
 			const float* __restrict__ y_ptr, 				// 各ラベルの確率
 			const int* __restrict__ unit_index_ptr, 		// パスの各ノードが示すラベルID
-			float* __restrict__ forward_prob_ptr, 			// 現時刻での各ノードへ到達する前向き確率
+			const float* __restrict__ prev_forward_prob_ptr, 			// 1つ前の時刻での各ノードへ到達する前向き確率
 			const float* __restrict__ recurrence_relation_ptr, 	// 接続関係
 			float* __restrict__ unit_prob_ptr, 				// 各時刻の各ノードへ到達する前向き確率
 			float* __restrict__ test_ptr,
@@ -29,16 +29,26 @@ extern "C"
 		if(column >= total_columns) return;
 		int batch_index = column / max_path_length;
 		int path_pos = column % max_path_length;			// パスのノードの位置
-		int unit_index = *(unit_index_ptr + column);
 		int path_length = *(path_length_ptr + batch_index);
 
-		*(test_ptr + column) = 0;
+		float* node_ptr = test_ptr + column;
+		*node_ptr = -10000000000;
 		for(int s = 0;s < path_length;s++){
 			const float connection = *(recurrence_relation_ptr + batch_index * max_path_length * max_path_length + path_pos * max_path_length + s);
-			if(connection == 0.0f){
-				*(test_ptr + column) += 1;
+			int unit_index = *(unit_index_ptr + batch_index * max_path_length + s);
+			const float prev_forward_prob = *(prev_forward_prob_ptr + batch_index * max_path_length + s);
+			const float prob = connection + prev_forward_prob;
+			// logsumexp
+			float max_value = prob;
+			float min_value = *node_ptr;
+			if (min_value > max_value) {
+				max_value = *node_ptr;
+				min_value = prob;
 			}
+			*node_ptr = max_value + logf(1 + expf(min_value - max_value));
 		}
+		int unit_index = *(unit_index_ptr + column);
+		*node_ptr += y_ptr[unit_index];
 	}
 }
 """
@@ -63,7 +73,7 @@ def _label_to_path(labels, blank_symbol, xp):
 
 
 def _log_dot(prob, rr, xp):
-	return _logsumexp(prob + xp.swapaxes(rr, 1, 2), xp, axis=2)
+	return _logsumexp(prob + rr, xp, axis=2)
 
 
 def _move_label_to_back(path, path_length, xp):
@@ -184,7 +194,7 @@ class CTCFunction(function.Function):
 			  (xp.eye(max_length, k=2, dtype=dtype) *
 			   (xp.arange(max_length, dtype=dtype) % dtype(2))[None, :]
 			   * repeat_mask[:, None]))
-		return self.log_matrix(rr * (path_length[:, None] > xp.arange(max_length))[..., None], xp)
+		return self.log_matrix(rr * (path_length[:, None] > xp.arange(max_length))[..., None], xp).swapaxes(1, 2)
 
 	# path probablity to label probability
 	def label_probability(self, label_size, path, path_length, multiply_seq, xp):
@@ -231,7 +241,11 @@ class CTCFunction(function.Function):
 		return ret
 
 	def calc_trans(self, yseq, input_length, label, label_length, path, path_length, xp):
+		max_path_length = path.shape[1]
+		batchsize = yseq.shape[1]
+
 		forward_prob = self.log_matrix(xp.eye(path.shape[1], dtype='f')[0], xp)[None, :]
+		forward_prob = xp.repeat(forward_prob, batchsize, axis=0)
 		backward_prob = forward_prob
 		offset = xp.arange(0, yseq[0].size, yseq[0].shape[1], dtype=path.dtype)[:, None]
 
@@ -240,27 +254,38 @@ class CTCFunction(function.Function):
 		frr = self.recurrence_relation(label, path_length, path.shape[1], np.float32, xp)
 		prob = xp.empty((len(yseq),) + unit_index.shape, dtype=forward_prob.dtype)
 
-		max_path_length = path.shape[1]
-		batchsize = yseq.shape[1]
 		total_columns = max_path_length * batchsize
 		thread_per_block = min(512, total_columns)
 		num_block = math.ceil(total_columns / thread_per_block)
 		assert thread_per_block * num_block >= total_columns
 
 		# forward computation.
-		print(path_length.flags)
+		frr = _as_contiguous(frr)
 		yseq = _as_contiguous(yseq)
 		for i, y in enumerate(yseq):
 			# calc forward probability in log scale
+			y = _as_contiguous(y)
+			forward_prob = _as_contiguous(forward_prob)
+			print("y")
 			print(y)
+			print("take y")
 			print(xp.take(y, unit_index))
 			start_time = time.time()
-			forward_prob = xp.take(y, unit_index) + _log_dot(forward_prob[:, None, :], frr, xp)
+			_forward_prob = xp.take(y, unit_index) + _log_dot(forward_prob[:, None, :], frr, xp)
 			prob[i] = forward_prob
 			print(time.time() - start_time)
 
 			take = xp.take(y, unit_index)
 			_take = xp.zeros_like(take)
+
+			print("unit_index")
+			print(unit_index)
+			print("frr")
+			print(frr)
+			print("forward_prob")
+			print(forward_prob)
+			print("_forward_prob")
+			print(_forward_prob)
 
 			start_time = time.time()
 			self._cuda_elementwise("forward_probability", 
@@ -270,7 +295,7 @@ class CTCFunction(function.Function):
 					forward_prob.data.ptr,
 					frr.data.ptr,
 					prob.data.ptr,
-					_take.data.ptr,
+					_forward_prob.data.ptr,
 					batchsize,
 					path_length.data.ptr,
 					max_path_length,
@@ -279,14 +304,8 @@ class CTCFunction(function.Function):
 				block=(thread_per_block, 1, 1), 
 				grid=(num_block, 1, 1))
 			print(time.time() - start_time)
-			print("frr")
-			print(frr)
-			print("forward_prob")
-			print(forward_prob)
-			print("take")
-			print(take)
-			print("_take")
-			print(_take)
+			print("_forward_prob")
+			print(_forward_prob)
 			raise Exception()
 
 		r_index = offset + _move_label_to_back(path, path_length, xp)

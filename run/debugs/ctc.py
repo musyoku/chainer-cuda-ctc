@@ -5,7 +5,7 @@ import chainer.functions as F
 sys.path.append(os.path.join("..", ".."))
 from functions import cupy_ctc, cuda_ctc
 
-gpu_device = 2
+gpu_device = 0
 cuda.get_device(gpu_device).use()
 
 def test_forward():
