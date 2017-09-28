@@ -15,14 +15,13 @@ extern "C"
 	void forward_probability(
 			const float* __restrict__ y_ptr, 				// 各ラベルの確率
 			const int* __restrict__ unit_index_ptr, 		// パスの各ノードが示すラベルID
-			const float* __restrict__ prev_forward_prob_ptr, 			// 1つ前の時刻での各ノードへ到達する前向き確率
+			const float* __restrict__ prev_forward_prob_ptr, 	// 1つ前の時刻での各ノードへ到達する前向き確率
 			const float* __restrict__ recurrence_relation_ptr, 	// 接続関係
 			float* __restrict__ unit_prob_ptr, 				// 各時刻の各ノードへ到達する前向き確率
-			float* __restrict__ test_ptr,
+			float* __restrict__ next_forward_prob_ptr,
 			const int batchsize, 
 			const int* __restrict__ path_length_ptr, 
-			const int max_path_length, 
-			const int t)									// 時刻
+			const int max_path_length)
 	{
 		int column = blockIdx.x * blockDim.x + threadIdx.x;	// 0 <= column < batchsize * max_path_length
 		int total_columns = batchsize * max_path_length;
@@ -31,11 +30,10 @@ extern "C"
 		int path_pos = column % max_path_length;			// パスのノードの位置
 		int path_length = *(path_length_ptr + batch_index);
 
-		float* node_ptr = test_ptr + column;
+		float* node_ptr = next_forward_prob_ptr + column;
 		*node_ptr = -10000000000;
 		for(int s = 0;s < path_length;s++){
 			const float connection = *(recurrence_relation_ptr + batch_index * max_path_length * max_path_length + path_pos * max_path_length + s);
-			int unit_index = *(unit_index_ptr + batch_index * max_path_length + s);
 			const float prev_forward_prob = *(prev_forward_prob_ptr + batch_index * max_path_length + s);
 			const float prob = connection + prev_forward_prob;
 			// logsumexp
@@ -49,6 +47,53 @@ extern "C"
 		}
 		int unit_index = *(unit_index_ptr + column);
 		*node_ptr += y_ptr[unit_index];
+	}
+
+	__global__ 
+	void backward_probability(
+			float* __restrict__ prev_backward_prob_ptr, 		// 1つ前の時刻での各ノードへ到達する前向き確率
+			const float* __restrict__ recurrence_relation_ptr, 	// 接続関係
+			float* __restrict__ next_backward_prob_ptr,
+			const int* __restrict__ prob_index_ptr,
+			float* __restrict__ prob_ptr,
+			const float* __restrict__ y_inv_ptr,
+			const int* __restrict__ r_index_ptr,
+			const int batchsize, 
+			const int* __restrict__ path_length_ptr, 
+			const int max_path_length,
+			const int t)
+	{
+		int column = blockIdx.x * blockDim.x + threadIdx.x;	// 0 <= column < batchsize * max_path_length
+		int total_columns = batchsize * max_path_length;
+		if(column >= total_columns) return;
+		int batch_index = column / max_path_length;
+		int path_pos = column % max_path_length;			// パスのノードの位置
+		int path_length = *(path_length_ptr + batch_index);
+
+		float* node_ptr = next_backward_prob_ptr + column;
+		*node_ptr = -10000000000;
+		for(int s = 0;s < path_length;s++){
+			const float connection = *(recurrence_relation_ptr + batch_index * max_path_length * max_path_length + path_pos * max_path_length + s);
+			const float prev_forward_prob = *(prev_backward_prob_ptr + batch_index * max_path_length + s);
+			const float prob = connection + prev_forward_prob;
+			// logsumexp
+			float max_value = prob;
+			float min_value = *node_ptr;
+			if (min_value > max_value) {
+				max_value = *node_ptr;
+				min_value = prob;
+			}
+			*node_ptr = max_value + logf(1 + expf(min_value - max_value));
+		}
+		float* prob_t_ptr = prob_ptr + t * batchsize * max_path_length + column;
+		const int prob_index = *(prob_index_ptr + column);
+
+		// xp.take(backward_prob[:, ::-1], backward_prob_index)
+		*prob_t_ptr += *(prev_backward_prob_ptr + (batch_index + 1) * max_path_length - prob_index % max_path_length - 1);
+
+		int r_index = *(r_index_ptr + column);
+		*(prev_backward_prob_ptr + column) += y_inv_ptr[r_index];
+
 	}
 }
 """
@@ -124,9 +169,12 @@ class CTCFunction(function.Function):
 	_cuda_module = None
 
 	def _cuda_elementwise(self, name, args, block, grid):
-		module = self._cuda_get_module()
-		func = module.get_function(name)
+		func = self._cuda_get_function(name)
 		func(args=args, block=block, grid=grid)
+
+	def _cuda_get_function(self, name):
+		module = self._cuda_get_module()
+		return module.get_function(name)
 
 	def _cuda_get_module(self):
 		if CTCFunction._cuda_module is not None:
@@ -262,51 +310,51 @@ class CTCFunction(function.Function):
 		# forward computation.
 		frr = _as_contiguous(frr)
 		yseq = _as_contiguous(yseq)
+		forward_prob = _as_contiguous(forward_prob)
+		cuda_func_forward_probability = self._cuda_get_function("forward_probability")
+		next_forward_prob = xp.zeros_like(forward_prob)
+
 		for i, y in enumerate(yseq):
 			# calc forward probability in log scale
 			y = _as_contiguous(y)
-			forward_prob = _as_contiguous(forward_prob)
-			print("y")
-			print(y)
-			print("take y")
-			print(xp.take(y, unit_index))
+			# print("y")
+			# print(y)
+			# print("take y")
+			# print(xp.take(y, unit_index))
 			start_time = time.time()
 			_forward_prob = xp.take(y, unit_index) + _log_dot(forward_prob[:, None, :], frr, xp)
-			prob[i] = forward_prob
-			print(time.time() - start_time)
+			# print(time.time() - start_time)
 
 			take = xp.take(y, unit_index)
 			_take = xp.zeros_like(take)
 
-			print("unit_index")
-			print(unit_index)
-			print("frr")
-			print(frr)
-			print("forward_prob")
-			print(forward_prob)
-			print("_forward_prob")
-			print(_forward_prob)
+			# print("unit_index")
+			# print(unit_index)
+			# print("frr")
+			# print(frr)
+			# print("_forward_prob")
+			# print(_forward_prob)
 
 			start_time = time.time()
-			self._cuda_elementwise("forward_probability", 
+			cuda_func_forward_probability(
 				args=[
 					y.data.ptr,
 					unit_index.data.ptr,
 					forward_prob.data.ptr,
 					frr.data.ptr,
 					prob.data.ptr,
-					_forward_prob.data.ptr,
+					next_forward_prob.data.ptr,
 					batchsize,
 					path_length.data.ptr,
 					max_path_length,
-					i,
 				], 
 				block=(thread_per_block, 1, 1), 
 				grid=(num_block, 1, 1))
-			print(time.time() - start_time)
-			print("_forward_prob")
-			print(_forward_prob)
-			raise Exception()
+			# print(time.time() - start_time)
+			# print("next_forward_prob")
+			# print(next_forward_prob)
+			forward_prob = next_forward_prob.copy()
+			prob[i] = forward_prob
 
 		r_index = offset + _move_label_to_back(path, path_length, xp)
 
@@ -314,17 +362,79 @@ class CTCFunction(function.Function):
 		yseq_inv = _move_inputs(yseq, input_length, xp)[::-1]
 		brr = self.recurrence_relation(_move_label_to_back(label, label_length, xp), path_length, path.shape[1], np.float32, xp)
 		# move to back.
-		prob = _move_inputs(prob, input_length, xp)
+		prob = _as_contiguous(_move_inputs(prob, input_length, xp))
+		# print("prob")
+		# print(prob)
 
 		# backward computation.
 		ps1 = path.shape[1]
-		backward_prob_index = (xp.arange(0, path.size, ps1, dtype=np.int32)[:, None] + (xp.arange(ps1) - path_length[:, None]) % ps1)
+		backward_prob_index = (xp.arange(0, path.size, ps1, dtype=np.int32)[:, None] + (xp.arange(ps1) - path_length[:, None]) % ps1).astype(np.int32)
+		backward_prob_index = _as_contiguous(backward_prob_index)
+		# print("unit_index")
+		# print(unit_index)
+		# print("backward_prob_index")
+		# print(backward_prob_index)
+
+		brr = _as_contiguous(brr)
+		# print("brr")
+		# print(brr)
+		yseq = _as_contiguous(yseq)
+		yseq_inv = _as_contiguous(yseq_inv)
+		next_backward_prob = xp.zeros_like(backward_prob)
+		cuda_func_backward_probability = self._cuda_get_function("backward_probability")
+		# print(yseq_inv.shape)
 		for i, y_inv in enumerate(yseq_inv):
+			t = yseq.shape[0] - 1 - i
+			y_inv = _as_contiguous(y_inv)
 			# calc backward probability
-			backward_prob = _log_dot(backward_prob[:, None, :], brr, xp)
-			prob[-i - 1] += xp.take(
-				backward_prob[:, ::-1], backward_prob_index)
-			backward_prob = xp.take(y_inv, r_index) + backward_prob
+			# print("backward_prob")
+			# print(backward_prob)
+			# _backward_prob = _log_dot(backward_prob[:, None, :], brr, xp)
+			# print("_log_dot")
+			# print(_backward_prob)
+			# print("take_bp")
+			# print(xp.take(backward_prob[:, ::-1], backward_prob_index))
+			# print("inv")
+			# print(backward_prob[:, ::-1])
+			# prob[-i - 1] += xp.take(backward_prob[:, ::-1], backward_prob_index)
+			# print("prob")
+			# print(prob[-i - 1] + xp.take(backward_prob[:, ::-1], backward_prob_index))
+			# print("take_y")
+			# print(xp.take(y_inv, r_index))
+			# backward_prob = xp.take(y_inv, r_index) + backward_prob
+			# print("backward_prob")
+			# print(xp.take(y_inv, r_index) + backward_prob)
+			# print("y_inv")
+			# print(y_inv)
+			# print("r_index")
+			# print(r_index)
+
+			cuda_func_backward_probability(
+				args=[
+					backward_prob.data.ptr,
+					brr.data.ptr,
+					next_backward_prob.data.ptr,
+					backward_prob_index.data.ptr,
+					prob.data.ptr,
+					y_inv.data.ptr,
+					r_index.data.ptr,
+					batchsize,
+					path_length.data.ptr,
+					max_path_length,
+					t,
+				], 
+				block=(thread_per_block, 1, 1), 
+				grid=(num_block, 1, 1))
+
+			# print("next_backward_prob")
+			# print(next_backward_prob)
+			# print("prob")
+			# print(prob[t])
+			# print("backward_prob")
+			# print(backward_prob)
+			# print("done")
+
+			# raise Exception()
 
 		# move to front.
 		return _move_inputs(prob, -self.input_length, xp)
