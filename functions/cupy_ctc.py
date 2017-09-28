@@ -47,7 +47,7 @@ def _move_inputs(prob, input_length, xp):
 	return xp.take(prob.reshape(seq * batch, ch), index, axis=0)
 
 
-class ConnectionistTemporalClassification(function.Function):
+class CTCFunction(function.Function):
 	def __init__(self, blank_symbol, reduce='mean'):
 		self.blank_symbol = blank_symbol
 		self.zero_padding = -10000000000.0
@@ -249,4 +249,4 @@ def connectionist_temporal_classification(x, t, blank_symbol, input_length=None,
 		label_length = variable.Variable(
 			xp.full((len(t.data),), len(t.data[0]), dtype=numpy.int32))
 
-	return ConnectionistTemporalClassification(blank_symbol, reduce)(input_length, label_length, t, *x)
+	return CTCFunction(blank_symbol, reduce)(input_length, label_length, t, *x)

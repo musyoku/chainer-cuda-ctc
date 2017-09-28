@@ -8,8 +8,7 @@ from chainer import testing
 from chainer.testing import attr
 from chainer.testing import condition
 sys.path.append(os.path.join("..", ".."))
-from functions import cupy_ctc
-
+from functions.cuda_ctc import connectionist_temporal_classification, CTCFunction 
 
 class CTCTestBase(object):
 
@@ -55,7 +54,7 @@ class CTCTestBase(object):
         args = (x, t, self.blank_symbol)
         if self.use_length:
             args += (chainer.Variable(x_length), chainer.Variable(l_length))
-        loss = cupy_ctc.connectionist_temporal_classification(
+        loss = connectionist_temporal_classification(
             *args, reduce=self.reduce).data
 
         # compute expected value by recursive computation.
@@ -90,7 +89,7 @@ class CTCTestBase(object):
     # expected value(via numerical differentiation) from t_data
     def check_backward(self, t_data, xs_data, l_length, x_length, gy_data):
         gradient_check.check_backward(
-            cupy_ctc.ConnectionistTemporalClassification(
+            CTCFunction(
                 self.blank_symbol, self.reduce),
             (x_length, l_length, t_data) + xs_data, gy_data,
             eps=1e-2, atol=1e-4)
@@ -202,7 +201,7 @@ class TestCTCUseNoBackpropMode(unittest.TestCase):
         with chainer.no_backprop_mode():
             x = [chainer.Variable(x_data) for x_data in xs_data]
             t = chainer.Variable(t_data)
-            cupy_ctc.connectionist_temporal_classification(x, t, 2)
+            connectionist_temporal_classification(x, t, 2)
 
 
 class TestCTCError(unittest.TestCase):
@@ -211,7 +210,7 @@ class TestCTCError(unittest.TestCase):
         x = chainer.Variable(numpy.zeros((4, 2, 3), numpy.float32))
         t = chainer.Variable(numpy.zeros((2, 2), numpy.int32))
         with self.assertRaises(TypeError):
-            cupy_ctc.connectionist_temporal_classification(x, t, 0)
+            connectionist_temporal_classification(x, t, 0)
 
 
 class TestCTCInvalidReductionOption(unittest.TestCase):
@@ -220,7 +219,7 @@ class TestCTCInvalidReductionOption(unittest.TestCase):
         x = chainer.Variable(numpy.zeros((4, 2, 3), numpy.float32))
         t = chainer.Variable(numpy.zeros((2, 2), numpy.int32))
         with self.assertRaises(ValueError):
-            cupy_ctc.connectionist_temporal_classification(
+            connectionist_temporal_classification(
                 tuple(x), t, 0, reduce='invalid_option')
 
 

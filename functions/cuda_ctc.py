@@ -89,10 +89,10 @@ extern "C"
 		const int prob_index = *(prob_index_ptr + column);
 
 		// xp.take(backward_prob[:, ::-1], backward_prob_index)
-		*prob_t_ptr += *(prev_backward_prob_ptr + (batch_index + 1) * max_path_length - prob_index % max_path_length - 1);
+		*prob_t_ptr += *(next_backward_prob_ptr + (batch_index + 1) * max_path_length - prob_index % max_path_length - 1);
 
 		int r_index = *(r_index_ptr + column);
-		*(prev_backward_prob_ptr + column) += y_inv_ptr[r_index];
+		*(prev_backward_prob_ptr + column) = *(next_backward_prob_ptr + column) + y_inv_ptr[r_index];
 
 	}
 }
@@ -156,12 +156,14 @@ def _as_contiguous(args):
 				ret.append(None)
 				continue
 			if arg.flags.c_contiguous is False:
-				arg = cupy.ascontiguousarray(arg)
+				xp = cuda.get_array_module(arg)
+				arg = xp.ascontiguousarray(arg)
 			ret.append(arg)
 		return ret
 
 	if args.flags.c_contiguous is False:
-		args = cupy.ascontiguousarray(args)
+		xp = cuda.get_array_module(args)
+		args = xp.ascontiguousarray(args)
 
 	return args
 
@@ -311,50 +313,57 @@ class CTCFunction(function.Function):
 		frr = _as_contiguous(frr)
 		yseq = _as_contiguous(yseq)
 		forward_prob = _as_contiguous(forward_prob)
-		cuda_func_forward_probability = self._cuda_get_function("forward_probability")
 		next_forward_prob = xp.zeros_like(forward_prob)
 
-		for i, y in enumerate(yseq):
-			# calc forward probability in log scale
-			y = _as_contiguous(y)
-			# print("y")
-			# print(y)
-			# print("take y")
-			# print(xp.take(y, unit_index))
-			start_time = time.time()
-			_forward_prob = xp.take(y, unit_index) + _log_dot(forward_prob[:, None, :], frr, xp)
-			# print(time.time() - start_time)
+		if xp is np:
+			for i, y in enumerate(yseq):
+				# calc forward probability in log scale
+				forward_prob = xp.take(y, unit_index) + _log_dot(forward_prob[:, None, :], frr, xp)
+				prob[i] = forward_prob
+		else:
+			cuda_func_forward_probability = self._cuda_get_function("forward_probability")
+			for i, y in enumerate(yseq):
+				# calc forward probability in log scale
+				y = _as_contiguous(y)
+				# print("y")
+				# print(y)
+				# print("take y")
+				# print(xp.take(y, unit_index))
+				# start_time = time.time()
+				# _forward_prob = xp.take(y, unit_index) + _log_dot(forward_prob[:, None, :], frr, xp)
+				# print(time.time() - start_time)
 
-			take = xp.take(y, unit_index)
-			_take = xp.zeros_like(take)
+				# take = xp.take(y, unit_index)
+				# _take = xp.zeros_like(take)
 
-			# print("unit_index")
-			# print(unit_index)
-			# print("frr")
-			# print(frr)
-			# print("_forward_prob")
-			# print(_forward_prob)
+				# print("unit_index")
+				# print(unit_index)
+				# print("frr")
+				# print(frr)
+				# print("_forward_prob")
+				# print(_forward_prob)
 
-			start_time = time.time()
-			cuda_func_forward_probability(
-				args=[
-					y.data.ptr,
-					unit_index.data.ptr,
-					forward_prob.data.ptr,
-					frr.data.ptr,
-					prob.data.ptr,
-					next_forward_prob.data.ptr,
-					batchsize,
-					path_length.data.ptr,
-					max_path_length,
-				], 
-				block=(thread_per_block, 1, 1), 
-				grid=(num_block, 1, 1))
-			# print(time.time() - start_time)
-			# print("next_forward_prob")
-			# print(next_forward_prob)
-			forward_prob = next_forward_prob.copy()
-			prob[i] = forward_prob
+				# start_time = time.time()
+				cuda_func_forward_probability(
+					args=[
+						y.data.ptr,
+						unit_index.data.ptr,
+						forward_prob.data.ptr,
+						frr.data.ptr,
+						prob.data.ptr,
+						next_forward_prob.data.ptr,
+						batchsize,
+						path_length.data.ptr,
+						max_path_length,
+					], 
+					block=(thread_per_block, 1, 1), 
+					grid=(num_block, 1, 1))
+				# print(time.time() - start_time)
+				# print("next_forward_prob")
+				# print(next_forward_prob)
+
+				forward_prob = next_forward_prob.copy()
+				prob[i] = forward_prob
 
 		r_index = offset + _move_label_to_back(path, path_length, xp)
 
@@ -381,60 +390,88 @@ class CTCFunction(function.Function):
 		yseq = _as_contiguous(yseq)
 		yseq_inv = _as_contiguous(yseq_inv)
 		next_backward_prob = xp.zeros_like(backward_prob)
-		cuda_func_backward_probability = self._cuda_get_function("backward_probability")
 		# print(yseq_inv.shape)
-		for i, y_inv in enumerate(yseq_inv):
-			t = yseq.shape[0] - 1 - i
-			y_inv = _as_contiguous(y_inv)
-			# calc backward probability
-			# print("backward_prob")
-			# print(backward_prob)
-			# _backward_prob = _log_dot(backward_prob[:, None, :], brr, xp)
-			# print("_log_dot")
-			# print(_backward_prob)
-			# print("take_bp")
-			# print(xp.take(backward_prob[:, ::-1], backward_prob_index))
-			# print("inv")
-			# print(backward_prob[:, ::-1])
-			# prob[-i - 1] += xp.take(backward_prob[:, ::-1], backward_prob_index)
-			# print("prob")
-			# print(prob[-i - 1] + xp.take(backward_prob[:, ::-1], backward_prob_index))
-			# print("take_y")
-			# print(xp.take(y_inv, r_index))
-			# backward_prob = xp.take(y_inv, r_index) + backward_prob
-			# print("backward_prob")
-			# print(xp.take(y_inv, r_index) + backward_prob)
-			# print("y_inv")
-			# print(y_inv)
-			# print("r_index")
-			# print(r_index)
+		if xp is np:
+			for i, y_inv in enumerate(yseq_inv):
+				# calc backward probability
+				backward_prob = _log_dot(backward_prob[:, None, :], brr, xp)
+				prob[-i - 1] += xp.take(backward_prob[:, ::-1], backward_prob_index)
+				backward_prob = xp.take(y_inv, r_index) + backward_prob
+		else:
+			cuda_func_backward_probability = self._cuda_get_function("backward_probability")
+			for i, y_inv in enumerate(yseq_inv):
+				t = yseq.shape[0] - 1 - i
+				y_inv = _as_contiguous(y_inv)
+				# calc backward probability
+				# print("backward_prob")
+				# print(backward_prob)
+				# _backward_prob = _log_dot(backward_prob[:, None, :], brr, xp)
+				# print("_log_dot")
+				# print(_backward_prob)
+				# print("take_bp")
+				# print(xp.take(backward_prob[:, ::-1], backward_prob_index))
+				# print("inv")
+				# print(backward_prob[:, ::-1])
+				# prob[-i - 1] += xp.take(backward_prob[:, ::-1], backward_prob_index)
+				# print("prob")
+				# print(prob[-i - 1] + xp.take(backward_prob[:, ::-1], backward_prob_index))
+				# print("take_y")
+				# print(xp.take(y_inv, r_index))
+				# backward_prob = xp.take(y_inv, r_index) + backward_prob
+				# print("backward_prob")
+				# print(xp.take(y_inv, r_index) + backward_prob)
+				# print("y_inv")
+				# print(y_inv)
+				# print("r_index")
+				# print(r_index)
 
-			cuda_func_backward_probability(
-				args=[
-					backward_prob.data.ptr,
-					brr.data.ptr,
-					next_backward_prob.data.ptr,
-					backward_prob_index.data.ptr,
-					prob.data.ptr,
-					y_inv.data.ptr,
-					r_index.data.ptr,
-					batchsize,
-					path_length.data.ptr,
-					max_path_length,
-					t,
-				], 
-				block=(thread_per_block, 1, 1), 
-				grid=(num_block, 1, 1))
+				# _backward_prob = _log_dot(backward_prob[:, None, :], brr, xp)
+				# print(xp.take(_backward_prob[:, ::-1], backward_prob_index))
+				# print("log_dot")
+				# print(_backward_prob)
+				# print("prob[-i-1")
+				# print(prob[-i - 1] + xp.take(_backward_prob[:, ::-1], backward_prob_index))
 
-			# print("next_backward_prob")
-			# print(next_backward_prob)
-			# print("prob")
-			# print(prob[t])
-			# print("backward_prob")
-			# print(backward_prob)
-			# print("done")
 
-			# raise Exception()
+				# _backward_prob = _log_dot(backward_prob[:, None, :], brr, xp)
+				# _backward_prob = xp.take(y_inv, r_index) + _backward_prob
+				# print(_backward_prob)
+				
+				cuda_func_backward_probability(
+					args=[
+						backward_prob.data.ptr,
+						brr.data.ptr,
+						next_backward_prob.data.ptr,
+						backward_prob_index.data.ptr,
+						prob.data.ptr,
+						y_inv.data.ptr,
+						r_index.data.ptr,
+						batchsize,
+						path_length.data.ptr,
+						max_path_length,
+						t,
+					], 
+					block=(thread_per_block, 1, 1), 
+					grid=(num_block, 1, 1))
+
+				# _backward_prob = xp.take(y_inv, r_index) + _backward_prob
+
+				# print("next_backward_prob")
+				# print(next_backward_prob)
+				# print(prob[t])
+
+				# raise Exception()
+
+				# print("next_backward_prob")
+				# print(next_backward_prob)
+				# print("prob")
+				# print(prob[t])
+				# print("backward_prob")
+				# print(backward_prob)
+				# print("done")
+				# print(backward_prob)
+				# raise Exception()
+				# raise Exception()
 
 		# move to front.
 		return _move_inputs(prob, -self.input_length, xp)
