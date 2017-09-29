@@ -12,7 +12,7 @@ CUDA_CTC_KERNEL = """
 extern "C" 
 {
 	__global__ 
-	void forward_probability(
+	void forward_dp(
 			const float* __restrict__ y_ptr, 				// 各ラベルの確率
 			const int* __restrict__ unit_index_ptr, 		// パスの各ノードが示すラベルID
 			const float* __restrict__ prev_forward_prob_ptr, 	// 1つ前の時刻での各ノードへ到達する前向き確率
@@ -49,16 +49,11 @@ extern "C"
 
 	__global__ 
 	void backward_log_dot(
-			float* __restrict__ prev_backward_prob_ptr, 		// 1つ前の時刻での各ノードへ到達する前向き確率
+			const float* __restrict__ prev_backward_prob_ptr, 		// 1つ前の時刻での各ノードへ到達する前向き確率
 			const float* __restrict__ recurrence_relation_ptr, 	// 接続関係
 			float* __restrict__ next_backward_prob_ptr,
-			const int* __restrict__ prob_index_ptr,
-			float* __restrict__ prob_ptr,
-			const float* __restrict__ y_inv_ptr,
-			const int* __restrict__ r_index_ptr,
 			const int batchsize, 
-			const int max_path_length,
-			const int t)
+			const int max_path_length)
 	{
 		int column = blockIdx.x * blockDim.x + threadIdx.x;	// 0 <= column < batchsize * max_path_length
 		int total_columns = batchsize * max_path_length;
@@ -86,7 +81,6 @@ extern "C"
 	__global__ 
 	void backward_update_probability(
 			float* __restrict__ prev_backward_prob_ptr, 		// 1つ前の時刻での各ノードへ到達する前向き確率
-			const float* __restrict__ recurrence_relation_ptr, 	// 接続関係
 			float* __restrict__ next_backward_prob_ptr,
 			const int* __restrict__ prob_index_ptr,
 			float* __restrict__ prob_ptr,
@@ -337,30 +331,11 @@ class CTCFunction(function.Function):
 				forward_prob = xp.take(y, unit_index) + _log_dot(forward_prob[:, None, :], frr, xp)
 				prob[i] = forward_prob
 		else:
-			cuda_func_forward_probability = self._cuda_get_function("forward_probability")
+			cuda_func_forward = self._cuda_get_function("forward_dp")
 			for i, y in enumerate(yseq):
 				# calc forward probability in log scale
 				y = _as_contiguous(y)
-				# print("y")
-				# print(y)
-				# print("take y")
-				# print(xp.take(y, unit_index))
-				# start_time = time.time()
-				# _forward_prob = xp.take(y, unit_index) + _log_dot(forward_prob[:, None, :], frr, xp)
-				# print(time.time() - start_time)
-
-				# take = xp.take(y, unit_index)
-				# _take = xp.zeros_like(take)
-
-				# print("unit_index")
-				# print(unit_index)
-				# print("frr")
-				# print(frr)
-				# print("_forward_prob")
-				# print(_forward_prob)
-
-				# start_time = time.time()
-				cuda_func_forward_probability(
+				cuda_func_forward(
 					args=[
 						y.data.ptr,
 						unit_index.data.ptr,
@@ -373,9 +348,6 @@ class CTCFunction(function.Function):
 					], 
 					block=(thread_per_block, 1, 1), 
 					grid=(num_block, 1, 1))
-				# print(time.time() - start_time)
-				# print("next_forward_prob")
-				# print(next_forward_prob)
 
 				forward_prob = next_forward_prob.copy()
 				prob[i] = forward_prob
@@ -387,8 +359,6 @@ class CTCFunction(function.Function):
 		brr = self.recurrence_relation(_move_label_to_back(label, label_length, xp), path_length, path.shape[1], np.float32, xp)
 		# move to back.
 		prob = _as_contiguous(_move_inputs(prob, input_length, xp))
-		# print("prob")
-		# print(prob)
 
 		# backward computation.
 		ps1 = path.shape[1]
@@ -406,16 +376,6 @@ class CTCFunction(function.Function):
 		yseq_inv = _as_contiguous(yseq_inv)
 		next_backward_prob = xp.zeros_like(backward_prob)
 
-
-		### DEBUG ###
-		_prob = prob.copy()	
-		_backward_prob = backward_prob.copy()
-
-
-
-
-
-
 		# print(yseq_inv.shape)
 		if xp is np:
 			for i, y_inv in enumerate(yseq_inv):
@@ -430,22 +390,13 @@ class CTCFunction(function.Function):
 				t = yseq.shape[0] - 1 - i
 				y_inv = _as_contiguous(y_inv)
 
-				# _backward_prob = _log_dot(_backward_prob[:, None, :], brr, xp)
-				# _prob[-i - 1] += xp.take(_backward_prob[:, ::-1], backward_prob_index)
-				# _backward_prob = xp.take(y_inv, r_index) + _backward_prob
-
 				cuda_func_log_dot(
 					args=[
 						backward_prob.data.ptr,
 						brr.data.ptr,
 						next_backward_prob.data.ptr,
-						backward_prob_index.data.ptr,
-						prob.data.ptr,
-						y_inv.data.ptr,
-						r_index.data.ptr,
 						batchsize,
 						max_path_length,
-						t,
 					], 
 					block=(thread_per_block, 1, 1), 
 					grid=(num_block, 1, 1))
@@ -454,7 +405,6 @@ class CTCFunction(function.Function):
 				cuda_func_backward_update(
 					args=[
 						backward_prob.data.ptr,
-						brr.data.ptr,
 						next_backward_prob.data.ptr,
 						backward_prob_index.data.ptr,
 						prob.data.ptr,
@@ -466,19 +416,6 @@ class CTCFunction(function.Function):
 					], 
 					block=(thread_per_block, 1, 1), 
 					grid=(num_block, 1, 1))
-
-
-				# print("prob")
-				# print(prob[t])
-				# print(_prob[-i - 1])
-				# print(abs(prob[t] - _prob[-i - 1]))
-				# print(xp.mean(abs(prob[t] - _prob[-i - 1])))
-
-				# print("backward_prob")
-				# print(backward_prob)
-				# print(_backward_prob)
-				# print(abs(backward_prob - _backward_prob))
-				# print(xp.mean(abs(backward_prob - _backward_prob)))
 
 		# move to front.
 		return _move_inputs(prob, -self.input_length, xp)
