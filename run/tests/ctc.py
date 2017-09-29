@@ -222,7 +222,7 @@ class TestCTCInvalidReductionOption(unittest.TestCase):
 			connectionist_temporal_classification(
 				tuple(x), t, 0, reduce='invalid_option')
 
-def test_forward(batchsize, label_length, seq_length, vocab_size, total_labels_to_fill, repeat=3):
+def compute_error_cupy_cuda(batchsize, label_length, seq_length, vocab_size, total_labels_to_fill, repeat=3):
 	xp = cupy
 	label_unigram = xp.random.randint(1, total_labels_to_fill, size=(batchsize, label_length)).astype(xp.int32)
 
@@ -262,7 +262,7 @@ def test_forward(batchsize, label_length, seq_length, vocab_size, total_labels_t
 
 	return error_forward, error_backward
 
-def test_recurrence_relation(batchsize, label_length, total_labels_to_fill):
+def check_recurrence_relation(batchsize, label_length, total_labels_to_fill):
 	xp = cupy
 	label = xp.random.randint(1, total_labels_to_fill, size=(batchsize, label_length)).astype(xp.int32)
 	flags_true = (label != xp.take(label, xp.arange(-1, label_length - 1) % label_length + xp.arange(0, batchsize * label_length, label_length)[:, None]))
@@ -282,7 +282,7 @@ def main():
 	label_length_list = [10, 30, 50]
 	vocab_size_list = [100, 500, 1000]
 
-	error = test_forward(16, 10, 30, 40, 40)
+	error = compute_error_cupy_cuda(16, 10, 30, 40, 40)
 
 	for batchsize in batchsize_list:
 		for label_length in label_length_list:
@@ -292,8 +292,8 @@ def main():
 					seq_length_list = [label_length * mul for mul in [3, 4, 5]]
 					for seq_length in seq_length_list:
 						total_labels = vocab_size
-						test_recurrence_relation(batchsize, label_length, total_labels)
-						error = test_forward(batchsize, label_length, seq_length, vocab_size, total_labels)
+						check_recurrence_relation(batchsize, label_length, total_labels)
+						error = compute_error_cupy_cuda(batchsize, label_length, seq_length, vocab_size, total_labels)
 						print("batchsize={}, label_length={}, seq_length={}, vocab={}, labels={}".format(batchsize, label_length, seq_length, vocab_size, total_labels), "OK", error)
 
 	testing.run_module(__name__, __file__)

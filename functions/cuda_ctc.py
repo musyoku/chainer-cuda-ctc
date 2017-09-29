@@ -105,6 +105,25 @@ extern "C"
 		int r_index = *(r_index_ptr + column);
 		*(prev_backward_prob_ptr + column) = *(next_backward_prob_ptr + column) + y_inv_ptr[r_index];
 	}
+
+	__global__ 
+	void move_inputs(
+			const float* __restrict__ input_ptr,
+			float* __restrict__ new_input_ptr,
+			const int* __restrict__ roll_ptr,
+			const int batchsize, 
+			const int height,
+			const int width)
+	{
+		int Id = blockIdx.x * blockDim.x + threadIdx.x;		// 0 <= Id < batchsize * height * width
+		int required_threads = batchsize * height * width;
+		if(Id >= required_threads) return;
+
+		int batch_index = (Id / width) % batchsize;
+		int roll = *(roll_ptr + batch_index) % height;
+		int shift = (Id + batchsize * width * roll) % required_threads;
+		*(new_input_ptr + Id) = *(input_ptr + shift);
+	}
 }
 """
 
@@ -142,7 +161,6 @@ def _move_inputs(prob, input_length, xp):
 	rotate = (xp.arange(seq)[:, None] + input_length) % seq
 	index = rotate * batch + xp.arange(batch)
 	return xp.take(prob.reshape(seq * batch, ch), index, axis=0)
-
 
 options = ["-ftz=true"]
 nvcc = None
@@ -244,24 +262,15 @@ class CTCFunction(function.Function):
 	def recurrence_relation(self, label, path_length, max_length, dtype, xp):
 		batch, lab = label.shape
 		repeat_mask = xp.ones((batch, lab * 2 + 1))
-		repeat_mask[:, 1::2] = (label !=
-								xp.take(label, xp.arange(-1, lab - 1)
-										% lab + xp.arange(0, batch * lab,
-														  lab)[:, None]))
+		repeat_mask[:, 1::2] = label != xp.roll(label, 1, axis=1)
 		repeat_mask[:, 1] = 1
-		rr = (xp.eye(max_length, dtype=dtype)[None, :] +
-			  xp.eye(max_length, k=1, dtype=dtype)[None, :] +
-			  (xp.eye(max_length, k=2, dtype=dtype) *
-			   (xp.arange(max_length, dtype=dtype) % dtype(2))[None, :]
-			   * repeat_mask[:, None]))
+		rr = (xp.eye(max_length, dtype=dtype)[None, :] + xp.eye(max_length, k=1, dtype=dtype)[None, :] + (xp.eye(max_length, k=2, dtype=dtype) * (xp.arange(max_length, dtype=dtype) % dtype(2))[None, :] * repeat_mask[:, None]))
 		return self.log_matrix(rr * (path_length[:, None] > xp.arange(max_length))[..., None], xp).swapaxes(1, 2)
 
 	# path probablity to label probability
 	def label_probability(self, label_size, path, path_length, multiply_seq, xp):
-		labels_prob = self.log_matrix(xp.zeros((len(path), label_size),
-											   dtype=multiply_seq.dtype), xp)
-		ret = xp.empty(
-			(len(multiply_seq),) + labels_prob.shape, dtype=labels_prob.dtype)
+		labels_prob = self.log_matrix(xp.zeros((len(path), label_size), dtype=multiply_seq.dtype), xp)
+		ret = xp.empty((len(multiply_seq),) + labels_prob.shape, dtype=labels_prob.dtype)
 		ret[...] = labels_prob
 		if xp == np:
 			for b in six.moves.range(len(path)):
@@ -302,6 +311,9 @@ class CTCFunction(function.Function):
 
 	def calc_trans(self, yseq, input_length, label, label_length, path, path_length, xp):
 		max_path_length = path.shape[1]
+		max_label_length = label.shape[1]
+		seq_length = yseq.shape[0]
+		vocab_size = yseq.shape[2]
 		batchsize = yseq.shape[1]
 
 		forward_prob = self.log_matrix(xp.eye(path.shape[1], dtype='f')[0], xp)[None, :]
@@ -314,10 +326,6 @@ class CTCFunction(function.Function):
 		frr = self.recurrence_relation(label, path_length, path.shape[1], np.float32, xp)
 		prob = xp.empty((len(yseq),) + unit_index.shape, dtype=forward_prob.dtype)
 
-		total_columns = max_path_length * batchsize
-		thread_per_block = min(512, total_columns)
-		num_block = math.ceil(total_columns / thread_per_block)
-		assert thread_per_block * num_block >= total_columns
 
 		# forward computation.
 		frr = _as_contiguous(frr)
@@ -331,6 +339,11 @@ class CTCFunction(function.Function):
 				forward_prob = xp.take(y, unit_index) + _log_dot(forward_prob[:, None, :], frr, xp)
 				prob[i] = forward_prob
 		else:
+			num_required_threads = max_path_length * batchsize
+			num_threads_per_block = min(512, num_required_threads)
+			num_blocks = math.ceil(num_required_threads / num_threads_per_block)
+			assert num_threads_per_block * num_blocks >= num_required_threads
+
 			cuda_func_forward = self._cuda_get_function("forward_dp")
 			for i, y in enumerate(yseq):
 				# calc forward probability in log scale
@@ -346,8 +359,8 @@ class CTCFunction(function.Function):
 						batchsize,
 						max_path_length,
 					], 
-					block=(thread_per_block, 1, 1), 
-					grid=(num_block, 1, 1))
+					block=(num_threads_per_block, 1, 1), 
+					grid=(num_blocks, 1, 1))
 
 				forward_prob = next_forward_prob.copy()
 				prob[i] = forward_prob
@@ -355,11 +368,50 @@ class CTCFunction(function.Function):
 		r_index = offset + _move_label_to_back(path, path_length, xp)
 
 		# rotate yseq with path_length
-		yseq_inv = _move_inputs(yseq, input_length, xp)[::-1]
-		brr = self.recurrence_relation(_move_label_to_back(label, label_length, xp), path_length, path.shape[1], np.float32, xp)
-		# move to back.
-		prob = _as_contiguous(_move_inputs(prob, input_length, xp))
 
+
+		cuda_move_inputs = self._cuda_get_function("move_inputs")
+
+		moved_yseq = xp.empty_like(yseq)
+		num_required_threads = yseq.size
+		num_threads_per_block = min(512, num_required_threads)
+		num_blocks = math.ceil(num_required_threads / num_threads_per_block)
+		assert num_threads_per_block * num_blocks >= num_required_threads
+		cuda_move_inputs(
+			args=[
+				yseq.data.ptr,
+				moved_yseq.data.ptr,
+				input_length.data.ptr,
+				yseq.shape[1],
+				yseq.shape[0],
+				yseq.shape[2],
+			], 
+			block=(num_threads_per_block, 1, 1), 
+			grid=(num_blocks, 1, 1))
+
+
+		moved_prob = xp.empty_like(prob)
+		num_required_threads = prob.size
+		num_threads_per_block = min(512, num_required_threads)
+		num_blocks = math.ceil(num_required_threads / num_threads_per_block)
+		assert num_threads_per_block * num_blocks >= num_required_threads
+		cuda_move_inputs(
+			args=[
+				prob.data.ptr,
+				moved_prob.data.ptr,
+				input_length.data.ptr,
+				prob.shape[1],
+				prob.shape[0],
+				prob.shape[2],
+			], 
+			block=(num_threads_per_block, 1, 1), 
+			grid=(num_blocks, 1, 1))
+
+		# yseq_inv = _move_inputs(yseq, input_length, xp)[::-1]
+		yseq_inv = moved_yseq[::-1]
+		prob = moved_prob
+
+		brr = self.recurrence_relation(_move_label_to_back(label, label_length, xp), path_length, path.shape[1], np.float32, xp)
 		# backward computation.
 		ps1 = path.shape[1]
 		backward_prob_index = (xp.arange(0, path.size, ps1, dtype=np.int32)[:, None] + (xp.arange(ps1) - path_length[:, None]) % ps1).astype(np.int32)
@@ -384,6 +436,11 @@ class CTCFunction(function.Function):
 				prob[-i - 1] += xp.take(backward_prob[:, ::-1], backward_prob_index)
 				backward_prob = xp.take(y_inv, r_index) + backward_prob
 		else:
+			num_required_threads = max_path_length * batchsize
+			num_threads_per_block = min(512, num_required_threads)
+			num_blocks = math.ceil(num_required_threads / num_threads_per_block)
+			assert num_threads_per_block * num_blocks >= num_required_threads
+
 			cuda_func_log_dot = self._cuda_get_function("backward_log_dot")
 			cuda_func_backward_update = self._cuda_get_function("backward_update_probability")
 			for i, y_inv in enumerate(yseq_inv):
@@ -398,8 +455,8 @@ class CTCFunction(function.Function):
 						batchsize,
 						max_path_length,
 					], 
-					block=(thread_per_block, 1, 1), 
-					grid=(num_block, 1, 1))
+					block=(num_threads_per_block, 1, 1), 
+					grid=(num_blocks, 1, 1))
 
 				# log_dotが完了してから呼ぶ必要があるため、カーネルを分ける必要がある
 				cuda_func_backward_update(
@@ -414,8 +471,8 @@ class CTCFunction(function.Function):
 						max_path_length,
 						t,
 					], 
-					block=(thread_per_block, 1, 1), 
-					grid=(num_block, 1, 1))
+					block=(num_threads_per_block, 1, 1), 
+					grid=(num_blocks, 1, 1))
 
 		# move to front.
 		return _move_inputs(prob, -self.input_length, xp)
@@ -463,8 +520,7 @@ class CTCFunction(function.Function):
 		else:
 			self.yseq *= grad_output[0][..., None]
 		# mask
-		self.yseq *= (
-			xp.arange(len(self.yseq))[:, None] < self.input_length)[..., None]
+		self.yseq *= (xp.arange(len(self.yseq))[:, None] < self.input_length)[..., None]
 		return (None, None, None) + tuple([y for y in self.yseq])
 
 
