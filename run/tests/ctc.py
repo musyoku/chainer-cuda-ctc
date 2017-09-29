@@ -1,30 +1,30 @@
 import math, sys, os
 import unittest
-import numpy
-import chainer
-from chainer import cuda
-from chainer import gradient_check
-from chainer import testing
+import numpy as np
+import chainer, cupy
+import chainer.functions as F
+from chainer import cuda, Variable, gradient_check, testing
 from chainer.testing import attr
 from chainer.testing import condition
 sys.path.append(os.path.join("..", ".."))
-from functions.cuda_ctc import connectionist_temporal_classification, CTCFunction 
+from functions import cuda_ctc, cupy_ctc
+from functions.cuda_ctc import connectionist_temporal_classification, CTCFunction
 
 class CTCTestBase(object):
 
     def setUp(self):
-        self.x = numpy.random.uniform(-1, 1, (4, 2, 3)).astype(numpy.float32)
-        self.t = numpy.array([[0, 1], [1, 0]]).astype(numpy.int32)
-        self.l = numpy.array([[2, 0, 2, 1, 2],
-                              [2, 1, 2, 0, 2]]).astype(numpy.int32)
+        self.x = np.random.uniform(-1, 1, (4, 2, 3)).astype(np.float32)
+        self.t = np.array([[0, 1], [1, 0]]).astype(np.int32)
+        self.l = np.array([[2, 0, 2, 1, 2],
+                              [2, 1, 2, 0, 2]]).astype(np.int32)
         self.blank_symbol = 2
-        self.x_length = numpy.full((len(self.x[0]),), len(self.x), dtype='i')
-        self.l_length = numpy.full((len(self.t),), len(self.t[0]), dtype='i')
+        self.x_length = np.full((len(self.x[0]),), len(self.x), dtype='i')
+        self.l_length = np.full((len(self.t),), len(self.t[0]), dtype='i')
         self.use_length = True
         if self.reduce == 'mean':
-            self.gy = numpy.random.uniform(-1, 1, ()).astype(numpy.float32)
+            self.gy = np.random.uniform(-1, 1, ()).astype(np.float32)
         else:
-            self.gy = numpy.random.uniform(-1, 1, (2,)).astype(numpy.float32)
+            self.gy = np.random.uniform(-1, 1, (2,)).astype(np.float32)
 
     # recursive forward computation.
     def alpha(self, x, l, t, u):
@@ -62,7 +62,7 @@ class CTCTestBase(object):
         xt = xp.swapaxes(self.x, 0, 1)
         for b in range(xt.shape[0]):
             for t in range(xt.shape[1]):
-                xt[b][t] = numpy.exp(xt[b][t]) / numpy.sum(numpy.exp(xt[b][t]))
+                xt[b][t] = np.exp(xt[b][t]) / np.sum(np.exp(xt[b][t]))
         batch_size = xt.shape[0]
         path_length = 2 * l_length + 1
         loss_expect = xp.zeros((batch_size,), dtype=xp.float32)
@@ -173,10 +173,10 @@ class TestCTCWithRepeatedLabel(unittest.TestCase, CTCTestBase):
 
     def setUp(self):
         CTCTestBase.setUp(self)
-        self.t = numpy.array([[0, 1, 1], [0, 1, 0]]).astype(numpy.int32)
-        self.l = numpy.array([[2, 0, 2, 1, 2, 1, 2],
-                              [2, 0, 2, 1, 2, 0, 2]]).astype(numpy.int32)
-        self.l_length = numpy.full((len(self.t),), len(self.t[0]), dtype='i')
+        self.t = np.array([[0, 1, 1], [0, 1, 0]]).astype(np.int32)
+        self.l = np.array([[2, 0, 2, 1, 2, 1, 2],
+                              [2, 0, 2, 1, 2, 0, 2]]).astype(np.int32)
+        self.l_length = np.full((len(self.t),), len(self.t[0]), dtype='i')
 
 
 @testing.parameterize(
@@ -187,17 +187,17 @@ class TestCTCBlankSymbol(unittest.TestCase, CTCTestBase):
 
     def setUp(self):
         CTCTestBase.setUp(self)
-        self.x = numpy.random.uniform(-1, 1, (4, 2, 4)).astype(numpy.float32)
-        self.l = numpy.array([[3, 0, 3, 1, 3],
-                              [3, 1, 3, 0, 3]]).astype(numpy.int32)
+        self.x = np.random.uniform(-1, 1, (4, 2, 4)).astype(np.float32)
+        self.l = np.array([[3, 0, 3, 1, 3],
+                              [3, 1, 3, 0, 3]]).astype(np.int32)
         self.blank_symbol = 3
 
 
 class TestCTCUseNoBackpropMode(unittest.TestCase):
 
     def test_no_backprop_mode(self):
-        xs_data = numpy.random.uniform(-1, 1, (4, 2, 3)).astype(numpy.float32)
-        t_data = numpy.array([[0, 1], [1, 0]]).astype(numpy.int32)
+        xs_data = np.random.uniform(-1, 1, (4, 2, 3)).astype(np.float32)
+        t_data = np.array([[0, 1], [1, 0]]).astype(np.int32)
         with chainer.no_backprop_mode():
             x = [chainer.Variable(x_data) for x_data in xs_data]
             t = chainer.Variable(t_data)
@@ -207,8 +207,8 @@ class TestCTCUseNoBackpropMode(unittest.TestCase):
 class TestCTCError(unittest.TestCase):
 
     def test_not_iterable(self):
-        x = chainer.Variable(numpy.zeros((4, 2, 3), numpy.float32))
-        t = chainer.Variable(numpy.zeros((2, 2), numpy.int32))
+        x = chainer.Variable(np.zeros((4, 2, 3), np.float32))
+        t = chainer.Variable(np.zeros((2, 2), np.int32))
         with self.assertRaises(TypeError):
             connectionist_temporal_classification(x, t, 0)
 
@@ -216,11 +216,63 @@ class TestCTCError(unittest.TestCase):
 class TestCTCInvalidReductionOption(unittest.TestCase):
 
     def test_not_iterable(self):
-        x = chainer.Variable(numpy.zeros((4, 2, 3), numpy.float32))
-        t = chainer.Variable(numpy.zeros((2, 2), numpy.int32))
+        x = chainer.Variable(np.zeros((4, 2, 3), np.float32))
+        t = chainer.Variable(np.zeros((2, 2), np.int32))
         with self.assertRaises(ValueError):
             connectionist_temporal_classification(
                 tuple(x), t, 0, reduce='invalid_option')
 
+def test_forward(batchsize, label_length, seq_length, vocab_size, total_labels_to_fill, repeat=3):
+    xp = cupy
+    label_unigram = xp.random.randint(1, total_labels_to_fill, size=(batchsize, label_length)).astype(xp.int32)
 
-testing.run_module(__name__, __file__)
+    num_transitions_to_same_label = xp.count_nonzero(label_unigram == xp.roll(label_unigram, 1))
+    assert seq_length >= label_length + num_transitions_to_same_label + 1, (seq_length, vocab_size, total_labels_to_fill)
+
+    length_unigram = xp.full((batchsize,), label_length, dtype=np.int32)
+    blank_symbol = 0
+
+    x_data = xp.random.normal(0, 1, size=batchsize*vocab_size*seq_length).reshape((batchsize, vocab_size, seq_length)).astype(xp.float32)
+
+    x = Variable(x_data)
+    out_data = F.swapaxes(x, 1, 2)
+    out_data = F.reshape(out_data, (batchsize, -1))
+    out_data = F.split_axis(out_data, seq_length, axis=1)
+
+    x_length = Variable(xp.full((batchsize,), seq_length, dtype=np.int32))
+
+    loss_cuda = cuda_ctc.connectionist_temporal_classification(out_data, label_unigram, blank_symbol, x_length, Variable(length_unigram), reduce="mean")
+    loss_cupy = cupy_ctc.connectionist_temporal_classification(out_data, label_unigram, blank_symbol, x_length, Variable(length_unigram), reduce="mean")
+
+    error_forward = abs(loss_cupy.data - loss_cuda.data)
+
+    assert error_forward < 5e-4, (error_forward, batchsize, label_length, seq_length, vocab_size, total_labels_to_fill, loss_cupy.data, loss_cuda.data)
+
+    x.cleargrad()
+
+
+    return error_forward
+
+def main():
+    np.set_printoptions(linewidth=200)
+    np.random.seed(0)
+    cupy.random.seed(0)
+    batchsize_list = [16, 32]
+    label_length_list = [10, 30, 50]
+    seq_length_list = [50, 100, 200]
+    vocab_size_list = [100, 500, 1000]
+
+    error = test_forward(16, 13, 30, 40, 40)
+
+    for batchsize in batchsize_list:
+        for label_length in label_length_list:
+            for seq_length in seq_length_list:
+                for vocab_size in vocab_size_list:
+                    total_labels = vocab_size
+                    error = test_forward(batchsize, label_length, seq_length, vocab_size, total_labels)
+                    print((batchsize, label_length, seq_length, vocab_size, total_labels), "OK", error)
+
+    testing.run_module(__name__, __file__)
+
+if __name__ == "__main__":
+    main()

@@ -20,7 +20,6 @@ extern "C"
 			float* __restrict__ unit_prob_ptr, 				// 各時刻の各ノードへ到達する前向き確率
 			float* __restrict__ next_forward_prob_ptr,
 			const int batchsize, 
-			const int* __restrict__ path_length_ptr, 
 			const int max_path_length)
 	{
 		int column = blockIdx.x * blockDim.x + threadIdx.x;	// 0 <= column < batchsize * max_path_length
@@ -28,11 +27,10 @@ extern "C"
 		if(column >= total_columns) return;
 		int batch_index = column / max_path_length;
 		int path_pos = column % max_path_length;			// パスのノードの位置
-		int path_length = *(path_length_ptr + batch_index);
 
 		float* node_ptr = next_forward_prob_ptr + column;
 		*node_ptr = -10000000000;
-		for(int s = 0;s < path_length;s++){
+		for(int s = 0;s < max_path_length;s++){
 			const float connection = *(recurrence_relation_ptr + batch_index * max_path_length * max_path_length + path_pos * max_path_length + s);
 			const float prev_forward_prob = *(prev_forward_prob_ptr + batch_index * max_path_length + s);
 			const float prob = connection + prev_forward_prob;
@@ -50,7 +48,7 @@ extern "C"
 	}
 
 	__global__ 
-	void backward_probability(
+	void backward_log_dot(
 			float* __restrict__ prev_backward_prob_ptr, 		// 1つ前の時刻での各ノードへ到達する前向き確率
 			const float* __restrict__ recurrence_relation_ptr, 	// 接続関係
 			float* __restrict__ next_backward_prob_ptr,
@@ -59,7 +57,6 @@ extern "C"
 			const float* __restrict__ y_inv_ptr,
 			const int* __restrict__ r_index_ptr,
 			const int batchsize, 
-			const int* __restrict__ path_length_ptr, 
 			const int max_path_length,
 			const int t)
 	{
@@ -68,11 +65,10 @@ extern "C"
 		if(column >= total_columns) return;
 		int batch_index = column / max_path_length;
 		int path_pos = column % max_path_length;			// パスのノードの位置
-		int path_length = *(path_length_ptr + batch_index);
 
 		float* node_ptr = next_backward_prob_ptr + column;
 		*node_ptr = -10000000000;
-		for(int s = 0;s < path_length;s++){
+		for(int s = 0;s < max_path_length;s++){
 			const float connection = *(recurrence_relation_ptr + batch_index * max_path_length * max_path_length + path_pos * max_path_length + s);
 			const float prev_forward_prob = *(prev_backward_prob_ptr + batch_index * max_path_length + s);
 			const float prob = connection + prev_forward_prob;
@@ -85,6 +81,27 @@ extern "C"
 			}
 			*node_ptr = max_value + logf(1 + expf(min_value - max_value));
 		}
+	}
+
+	__global__ 
+	void backward_update_probability(
+			float* __restrict__ prev_backward_prob_ptr, 		// 1つ前の時刻での各ノードへ到達する前向き確率
+			const float* __restrict__ recurrence_relation_ptr, 	// 接続関係
+			float* __restrict__ next_backward_prob_ptr,
+			const int* __restrict__ prob_index_ptr,
+			float* __restrict__ prob_ptr,
+			const float* __restrict__ y_inv_ptr,
+			const int* __restrict__ r_index_ptr,
+			const int batchsize, 
+			const int max_path_length,
+			const int t)
+	{
+		int column = blockIdx.x * blockDim.x + threadIdx.x;	// 0 <= column < batchsize * max_path_length
+		int total_columns = batchsize * max_path_length;
+		if(column >= total_columns) return;
+		int batch_index = column / max_path_length;
+		int path_pos = column % max_path_length;			// パスのノードの位置
+
 		float* prob_t_ptr = prob_ptr + t * batchsize * max_path_length + column;
 		const int prob_index = *(prob_index_ptr + column);
 
@@ -93,7 +110,6 @@ extern "C"
 
 		int r_index = *(r_index_ptr + column);
 		*(prev_backward_prob_ptr + column) = *(next_backward_prob_ptr + column) + y_inv_ptr[r_index];
-
 	}
 }
 """
@@ -353,7 +369,6 @@ class CTCFunction(function.Function):
 						prob.data.ptr,
 						next_forward_prob.data.ptr,
 						batchsize,
-						path_length.data.ptr,
 						max_path_length,
 					], 
 					block=(thread_per_block, 1, 1), 
@@ -390,6 +405,17 @@ class CTCFunction(function.Function):
 		yseq = _as_contiguous(yseq)
 		yseq_inv = _as_contiguous(yseq_inv)
 		next_backward_prob = xp.zeros_like(backward_prob)
+
+
+		### DEBUG ###
+		_prob = prob.copy()	
+		_backward_prob = backward_prob.copy()
+
+
+
+
+
+
 		# print(yseq_inv.shape)
 		if xp is np:
 			for i, y_inv in enumerate(yseq_inv):
@@ -398,7 +424,8 @@ class CTCFunction(function.Function):
 				prob[-i - 1] += xp.take(backward_prob[:, ::-1], backward_prob_index)
 				backward_prob = xp.take(y_inv, r_index) + backward_prob
 		else:
-			cuda_func_backward_probability = self._cuda_get_function("backward_probability")
+			cuda_func_log_dot = self._cuda_get_function("backward_log_dot")
+			cuda_func_backward_update = self._cuda_get_function("backward_update_probability")
 			for i, y_inv in enumerate(yseq_inv):
 				t = yseq.shape[0] - 1 - i
 				y_inv = _as_contiguous(y_inv)
@@ -436,8 +463,20 @@ class CTCFunction(function.Function):
 				# _backward_prob = _log_dot(backward_prob[:, None, :], brr, xp)
 				# _backward_prob = xp.take(y_inv, r_index) + _backward_prob
 				# print(_backward_prob)
-				
-				cuda_func_backward_probability(
+				# print("	backward_probability")
+				# _backward_prob = _log_dot(_backward_prob[:, None, :], brr, xp)
+				# _prob[-i - 1] += xp.take(_backward_prob[:, ::-1], backward_prob_index)
+				# __backward_prob = xp.take(y_inv, r_index) + _backward_prob
+
+				# print("prob_t")
+				# print(_prob[-i - 1])
+
+
+				# ## DEBUG ###
+				# reverse = _as_contiguous(prob[t].copy())
+				# prob_zeros = xp.zeros_like(prob)
+
+				cuda_func_log_dot(
 					args=[
 						backward_prob.data.ptr,
 						brr.data.ptr,
@@ -447,12 +486,30 @@ class CTCFunction(function.Function):
 						y_inv.data.ptr,
 						r_index.data.ptr,
 						batchsize,
-						path_length.data.ptr,
 						max_path_length,
 						t,
 					], 
 					block=(thread_per_block, 1, 1), 
 					grid=(num_block, 1, 1))
+
+				cuda_func_backward_update(
+					args=[
+						backward_prob.data.ptr,
+						brr.data.ptr,
+						next_backward_prob.data.ptr,
+						backward_prob_index.data.ptr,
+						prob.data.ptr,
+						y_inv.data.ptr,
+						r_index.data.ptr,
+						batchsize,
+						max_path_length,
+						t,
+					], 
+					block=(thread_per_block, 1, 1), 
+					grid=(num_block, 1, 1))
+
+				# print(next_backward_prob)
+				# raise Exception()
 
 				# _backward_prob = xp.take(y_inv, r_index) + _backward_prob
 
@@ -468,9 +525,35 @@ class CTCFunction(function.Function):
 				# print(prob[t])
 				# print("backward_prob")
 				# print(backward_prob)
+				# print(_backward_prob)
+				# print(abs(backward_prob - _backward_prob))
+				# print(xp.mean(abs(backward_prob - _backward_prob)))
+				# print(abs(prob[t] - _prob[-i - 1]))
+				# print(xp.mean(abs(prob[t] - _prob[-i - 1])))
+
+				# print("reverse")
+				# print(reverse)
+				# print("reverse-orig")
+				# print(_backward_prob[:, ::-1])
+
+				# print("next_backward_prob")
+				# print(next_backward_prob.flags)
+				# print(next_backward_prob.dtype)
+				# print(next_backward_prob)
+				# print(_backward_prob)
+				# print(abs(next_backward_prob - _backward_prob))
+				# print(xp.mean(abs(next_backward_prob - _backward_prob)))
+
+				# _backward_prob = __backward_prob
+
+				# print(backward_prob)
+				# print(_backward_prob)
+				# print(abs(backward_prob - _backward_prob))
+				# print(xp.mean(abs(backward_prob - _backward_prob)))
+
+				# raise Exception()
 				# print("done")
 				# print(backward_prob)
-				# raise Exception()
 				# raise Exception()
 
 		# move to front.

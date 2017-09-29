@@ -9,7 +9,8 @@ gpu_device = 0
 cuda.get_device(gpu_device).use()
 
 def test_forward():
-	np.set_printoptions(linewidth=200, precision=2)
+	np.set_printoptions(linewidth=200)
+	# np.set_printoptions(linewidth=200, precision=2)
 	xp = cupy
 	# np.random.seed(0)
 	label_unigram = xp.asarray([
