@@ -63,10 +63,10 @@ class CTCTestBase(object):
 		for b in range(xt.shape[0]):
 			for t in range(xt.shape[1]):
 				xt[b][t] = np.exp(xt[b][t]) / np.sum(np.exp(xt[b][t]))
-		batch_size = xt.shape[0]
+		batchsize = xt.shape[0]
 		path_length = 2 * l_length + 1
-		loss_expect = xp.zeros((batch_size,), dtype=xp.float32)
-		for i in range(batch_size):
+		loss_expect = xp.zeros((batchsize,), dtype=xp.float32)
+		for i in range(batchsize):
 			xtb, lb, xlb, plb = xt[i], self.l[i], x_length[i], path_length[i]
 			loss_expect[i] = -math.log(
 				self.alpha(xtb, lb, int(xlb - 1), int(plb - 1)) +
@@ -222,12 +222,12 @@ class TestCTCInvalidReductionOption(unittest.TestCase):
 			connectionist_temporal_classification(
 				tuple(x), t, 0, reduce='invalid_option')
 
-def test_forward(batchsize, label_length, vocab_size, total_labels_to_fill, repeat=3):
+def test_forward(batchsize, label_length, seq_length, vocab_size, total_labels_to_fill, repeat=3):
 	xp = cupy
 	label_unigram = xp.random.randint(1, total_labels_to_fill, size=(batchsize, label_length)).astype(xp.int32)
 
-	num_transitions_to_same_label = xp.count_nonzero(label_unigram == xp.roll(label_unigram, 1))
-	seq_length = ((label_length + num_transitions_to_same_label + 1) // 10 + 1) * 10
+	num_transitions_to_same_label = xp.count_nonzero(label_unigram == xp.roll(label_unigram, 1, axis=1))
+	assert seq_length >= label_length + num_transitions_to_same_label + 1
 
 	length_unigram = xp.full((batchsize,), label_length, dtype=np.int32)
 	blank_symbol = 0
@@ -244,15 +244,35 @@ def test_forward(batchsize, label_length, vocab_size, total_labels_to_fill, repe
 	loss_cuda = cuda_ctc.connectionist_temporal_classification(out_data, label_unigram, blank_symbol, x_length, Variable(length_unigram), reduce="mean")
 	loss_cupy = cupy_ctc.connectionist_temporal_classification(out_data, label_unigram, blank_symbol, x_length, Variable(length_unigram), reduce="mean")
 
-	error_forward = abs(loss_cupy.data - loss_cuda.data)
+	error_forward = abs(float(loss_cupy.data) - float(loss_cuda.data))
 
 	assert error_forward < 5e-4, "error={}, batchsize={}, label_length={}, seq_length={}, vocab={}, labels={}, loss_cupy={}, loss_cuda={}".format(error_forward, 
 		batchsize, label_length, seq_length, vocab_size, total_labels_to_fill, loss_cupy.data, loss_cuda.data)
 
 	x.cleargrad()
+	loss_cuda.backward()
+	grad_cuda = x.grad.copy()
+	loss_cupy.backward()
+	grad_cupy = x.grad.copy()
 
+	error_backward = float(xp.mean(abs(grad_cupy - grad_cuda)))
 
-	return error_forward, seq_length
+	assert error_backward < 5e-3, "error={}, batchsize={}, label_length={}, seq_length={}, vocab={}, labels={}, loss_cupy={}, loss_cuda={}".format(error_backward, 
+		batchsize, label_length, seq_length, vocab_size, total_labels_to_fill, loss_cupy.data, loss_cuda.data)
+
+	return error_forward, error_backward
+
+def test_recurrence_relation(batchsize, label_length, total_labels_to_fill):
+	xp = cupy
+	label = xp.random.randint(1, total_labels_to_fill, size=(batchsize, label_length)).astype(xp.int32)
+	flags_true = (label != xp.take(label, xp.arange(-1, label_length - 1) % label_length + xp.arange(0, batchsize * label_length, label_length)[:, None]))
+	flags_roll = (label != xp.roll(label, 1, axis=1))
+
+	if xp.sum(flags_true.astype(xp.int32) - flags_roll.astype(xp.int32)) != 0:
+		print(label)
+		print(flags_true)
+		print(flags_roll)
+	assert xp.sum(flags_true.astype(xp.int32) - flags_roll.astype(xp.int32)) == 0
 
 def main():
 	np.set_printoptions(linewidth=200)
@@ -262,15 +282,17 @@ def main():
 	label_length_list = [10, 30, 50]
 	vocab_size_list = [100, 500, 1000]
 
-	error = test_forward(16, 13, 40, 40)
+	error = test_forward(16, 10, 30, 40, 40)
 
 	for batchsize in batchsize_list:
 		for label_length in label_length_list:
 			for vocab_size in vocab_size_list:
 				total_labels_list = [vocab_size // div for div in [2, 5, 10, 50]]
 				for total_labels in total_labels_list:
+					seq_length_list = [label_length * mul for mul in [3, 4, 5]]
 					for seq_length in seq_length_list:
 						total_labels = vocab_size
+						test_recurrence_relation(batchsize, label_length, total_labels)
 						error = test_forward(batchsize, label_length, seq_length, vocab_size, total_labels)
 						print("batchsize={}, label_length={}, seq_length={}, vocab={}, labels={}".format(batchsize, label_length, seq_length, vocab_size, total_labels), "OK", error)
 
