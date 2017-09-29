@@ -338,6 +338,10 @@ class CTCFunction(function.Function):
 				# calc forward probability in log scale
 				forward_prob = xp.take(y, unit_index) + _log_dot(forward_prob[:, None, :], frr, xp)
 				prob[i] = forward_prob
+
+			yseq_inv = _move_inputs(yseq, input_length, xp)[::-1]
+			prob = _move_inputs(prob, input_length, xp)
+			
 		else:
 			num_required_threads = max_path_length * batchsize
 			num_threads_per_block = min(512, num_required_threads)
@@ -365,51 +369,53 @@ class CTCFunction(function.Function):
 				forward_prob = next_forward_prob.copy()
 				prob[i] = forward_prob
 
+			cuda_move_inputs = self._cuda_get_function("move_inputs")
+
+			moved_yseq = xp.empty_like(yseq)
+			num_required_threads = yseq.size
+			num_threads_per_block = min(512, num_required_threads)
+			num_blocks = math.ceil(num_required_threads / num_threads_per_block)
+			assert num_threads_per_block * num_blocks >= num_required_threads
+			cuda_move_inputs(
+				args=[
+					yseq.data.ptr,
+					moved_yseq.data.ptr,
+					input_length.data.ptr,
+					yseq.shape[1],
+					yseq.shape[0],
+					yseq.shape[2],
+				], 
+				block=(num_threads_per_block, 1, 1), 
+				grid=(num_blocks, 1, 1))
+
+
+			moved_prob = xp.empty_like(prob)
+			num_required_threads = prob.size
+			num_threads_per_block = min(512, num_required_threads)
+			num_blocks = math.ceil(num_required_threads / num_threads_per_block)
+			assert num_threads_per_block * num_blocks >= num_required_threads
+			cuda_move_inputs(
+				args=[
+					prob.data.ptr,
+					moved_prob.data.ptr,
+					input_length.data.ptr,
+					prob.shape[1],
+					prob.shape[0],
+					prob.shape[2],
+				], 
+				block=(num_threads_per_block, 1, 1), 
+				grid=(num_blocks, 1, 1))
+
+			# yseq_inv = _move_inputs(yseq, input_length, xp)[::-1]
+			yseq_inv = moved_yseq[::-1]
+			prob = moved_prob
+
+
 		r_index = offset + _move_label_to_back(path, path_length, xp)
 
 		# rotate yseq with path_length
 
 
-		cuda_move_inputs = self._cuda_get_function("move_inputs")
-
-		moved_yseq = xp.empty_like(yseq)
-		num_required_threads = yseq.size
-		num_threads_per_block = min(512, num_required_threads)
-		num_blocks = math.ceil(num_required_threads / num_threads_per_block)
-		assert num_threads_per_block * num_blocks >= num_required_threads
-		cuda_move_inputs(
-			args=[
-				yseq.data.ptr,
-				moved_yseq.data.ptr,
-				input_length.data.ptr,
-				yseq.shape[1],
-				yseq.shape[0],
-				yseq.shape[2],
-			], 
-			block=(num_threads_per_block, 1, 1), 
-			grid=(num_blocks, 1, 1))
-
-
-		moved_prob = xp.empty_like(prob)
-		num_required_threads = prob.size
-		num_threads_per_block = min(512, num_required_threads)
-		num_blocks = math.ceil(num_required_threads / num_threads_per_block)
-		assert num_threads_per_block * num_blocks >= num_required_threads
-		cuda_move_inputs(
-			args=[
-				prob.data.ptr,
-				moved_prob.data.ptr,
-				input_length.data.ptr,
-				prob.shape[1],
-				prob.shape[0],
-				prob.shape[2],
-			], 
-			block=(num_threads_per_block, 1, 1), 
-			grid=(num_blocks, 1, 1))
-
-		# yseq_inv = _move_inputs(yseq, input_length, xp)[::-1]
-		yseq_inv = moved_yseq[::-1]
-		prob = moved_prob
 
 		brr = self.recurrence_relation(_move_label_to_back(label, label_length, xp), path_length, path.shape[1], np.float32, xp)
 		# backward computation.
