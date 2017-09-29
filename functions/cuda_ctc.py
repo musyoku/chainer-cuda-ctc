@@ -429,52 +429,10 @@ class CTCFunction(function.Function):
 			for i, y_inv in enumerate(yseq_inv):
 				t = yseq.shape[0] - 1 - i
 				y_inv = _as_contiguous(y_inv)
-				# calc backward probability
-				# print("backward_prob")
-				# print(backward_prob)
-				# _backward_prob = _log_dot(backward_prob[:, None, :], brr, xp)
-				# print("_log_dot")
-				# print(_backward_prob)
-				# print("take_bp")
-				# print(xp.take(backward_prob[:, ::-1], backward_prob_index))
-				# print("inv")
-				# print(backward_prob[:, ::-1])
-				# prob[-i - 1] += xp.take(backward_prob[:, ::-1], backward_prob_index)
-				# print("prob")
-				# print(prob[-i - 1] + xp.take(backward_prob[:, ::-1], backward_prob_index))
-				# print("take_y")
-				# print(xp.take(y_inv, r_index))
-				# backward_prob = xp.take(y_inv, r_index) + backward_prob
-				# print("backward_prob")
-				# print(xp.take(y_inv, r_index) + backward_prob)
-				# print("y_inv")
-				# print(y_inv)
-				# print("r_index")
-				# print(r_index)
 
-				# _backward_prob = _log_dot(backward_prob[:, None, :], brr, xp)
-				# print(xp.take(_backward_prob[:, ::-1], backward_prob_index))
-				# print("log_dot")
-				# print(_backward_prob)
-				# print("prob[-i-1")
-				# print(prob[-i - 1] + xp.take(_backward_prob[:, ::-1], backward_prob_index))
-
-
-				# _backward_prob = _log_dot(backward_prob[:, None, :], brr, xp)
-				# _backward_prob = xp.take(y_inv, r_index) + _backward_prob
-				# print(_backward_prob)
-				# print("	backward_probability")
 				# _backward_prob = _log_dot(_backward_prob[:, None, :], brr, xp)
 				# _prob[-i - 1] += xp.take(_backward_prob[:, ::-1], backward_prob_index)
-				# __backward_prob = xp.take(y_inv, r_index) + _backward_prob
-
-				# print("prob_t")
-				# print(_prob[-i - 1])
-
-
-				# ## DEBUG ###
-				# reverse = _as_contiguous(prob[t].copy())
-				# prob_zeros = xp.zeros_like(prob)
+				# _backward_prob = xp.take(y_inv, r_index) + _backward_prob
 
 				cuda_func_log_dot(
 					args=[
@@ -492,6 +450,7 @@ class CTCFunction(function.Function):
 					block=(thread_per_block, 1, 1), 
 					grid=(num_block, 1, 1))
 
+				# log_dotが完了してから呼ぶ必要があるため、カーネルを分ける必要がある
 				cuda_func_backward_update(
 					args=[
 						backward_prob.data.ptr,
@@ -508,53 +467,18 @@ class CTCFunction(function.Function):
 					block=(thread_per_block, 1, 1), 
 					grid=(num_block, 1, 1))
 
-				# print(next_backward_prob)
-				# raise Exception()
 
-				# _backward_prob = xp.take(y_inv, r_index) + _backward_prob
-
-				# print("next_backward_prob")
-				# print(next_backward_prob)
-				# print(prob[t])
-
-				# raise Exception()
-
-				# print("next_backward_prob")
-				# print(next_backward_prob)
 				# print("prob")
 				# print(prob[t])
+				# print(_prob[-i - 1])
+				# print(abs(prob[t] - _prob[-i - 1]))
+				# print(xp.mean(abs(prob[t] - _prob[-i - 1])))
+
 				# print("backward_prob")
 				# print(backward_prob)
 				# print(_backward_prob)
 				# print(abs(backward_prob - _backward_prob))
 				# print(xp.mean(abs(backward_prob - _backward_prob)))
-				# print(abs(prob[t] - _prob[-i - 1]))
-				# print(xp.mean(abs(prob[t] - _prob[-i - 1])))
-
-				# print("reverse")
-				# print(reverse)
-				# print("reverse-orig")
-				# print(_backward_prob[:, ::-1])
-
-				# print("next_backward_prob")
-				# print(next_backward_prob.flags)
-				# print(next_backward_prob.dtype)
-				# print(next_backward_prob)
-				# print(_backward_prob)
-				# print(abs(next_backward_prob - _backward_prob))
-				# print(xp.mean(abs(next_backward_prob - _backward_prob)))
-
-				# _backward_prob = __backward_prob
-
-				# print(backward_prob)
-				# print(_backward_prob)
-				# print(abs(backward_prob - _backward_prob))
-				# print(xp.mean(abs(backward_prob - _backward_prob)))
-
-				# raise Exception()
-				# print("done")
-				# print(backward_prob)
-				# raise Exception()
 
 		# move to front.
 		return _move_inputs(prob, -self.input_length, xp)
